@@ -20,9 +20,33 @@ type Peer = {
     (event: "error", callback: () => void): void;
   };
 };
-type PeerConstructor = new () => Peer;
+type IceServer = { urls: string | string[]; username?: string; credential?: string };
+type PeerOptions = { config?: { iceServers: IceServer[] } };
+type PeerConstructor = new (id?: string, options?: PeerOptions) => Peer;
 
 declare global { interface Window { Peer?: PeerConstructor } }
+
+// STUN handles simple NATs; the TURN relay is what makes cross-network play
+// actually work (mobile data, corporate/symmetric NAT). Without it, peers on
+// different networks never open a data channel and the lobby hangs forever.
+// These are free public servers — swap in your own TURN creds for production.
+const ICE_SERVERS: IceServer[] = [
+  { urls: "stun:stun.l.google.com:19302" },
+  { urls: "stun:stun1.l.google.com:19302" },
+  {
+    urls: [
+      "turn:openrelay.metered.ca:80",
+      "turn:openrelay.metered.ca:443",
+      "turn:openrelay.metered.ca:443?transport=tcp",
+    ],
+    username: "openrelayproject",
+    credential: "openrelayproject",
+  },
+];
+
+// How long to wait for a peer connection before telling the user it failed,
+// instead of leaving them staring at a frozen lobby.
+const CONNECT_TIMEOUT_MS = 25000;
 
 let peerLoader: Promise<PeerConstructor> | null = null;
 const loadPeer = () => {
@@ -64,6 +88,7 @@ export default function Game() {
   const roleRef = useRef<Player>("host");
   const phaseRef = useRef<Phase>("lobby");
   const rafRef = useRef(0);
+  const connectTimerRef = useRef<number | undefined>(undefined);
   const keysRef = useRef(new Set<string>());
   const [phase, setPhaseState] = useState<Phase>("lobby");
   const [role, setRole] = useState<Player>("host");
@@ -95,6 +120,7 @@ export default function Game() {
   }, []);
 
   const finishConnection = useCallback((conn: DataConnection, playerRole: Player) => {
+    window.clearTimeout(connectTimerRef.current);
     connRef.current = conn;
     roleRef.current = playerRole;
     setRole(playerRole);
@@ -138,7 +164,7 @@ export default function Game() {
     setPhase("connecting");
     setStatus("Opening a table…");
     const PeerClass = await loadPeer();
-    const peer = new PeerClass();
+    const peer = new PeerClass(undefined, { config: { iceServers: ICE_SERVERS } });
     peerRef.current = peer;
     peer.on("open", (id) => {
       const url = new URL(window.location.href);
@@ -148,7 +174,12 @@ export default function Game() {
       setStatus("Send the link to your opponent");
       setPhase("waiting");
     });
-    peer.on("connection", (conn) => finishConnection(conn, "host"));
+    peer.on("connection", (conn) => {
+      // The incoming connection isn't usable until its channel opens; only then
+      // do we start the match, so a failed handshake doesn't strand the host.
+      if (conn.open) finishConnection(conn, "host");
+      else conn.on("open", () => finishConnection(conn, "host"));
+    });
     peer.on("error", () => {
       setStatus("Couldn’t open a room. Please try again.");
       setPhase("lobby");
@@ -159,17 +190,28 @@ export default function Game() {
     setPhase("connecting");
     setStatus("Joining the table…");
     const PeerClass = await loadPeer();
-    const peer = new PeerClass();
+    const peer = new PeerClass(undefined, { config: { iceServers: ICE_SERVERS } });
     peerRef.current = peer;
+    // If the data channel never opens (unreachable host / blocked network),
+    // surface it instead of spinning on "Joining…" forever.
+    connectTimerRef.current = window.setTimeout(() => {
+      if (phaseRef.current === "playing") return;
+      peerRef.current?.destroy();
+      peerRef.current = null;
+      setStatus("Couldn’t reach the host. Check the link or try a different network.");
+      setPhase("lobby");
+    }, CONNECT_TIMEOUT_MS);
     peer.on("open", () => {
       const conn = peer.connect(roomId, { reliable: false, serialization: "json" });
       conn.on("open", () => finishConnection(conn, "guest"));
       conn.on("error", () => {
+        window.clearTimeout(connectTimerRef.current);
         setStatus("That room is no longer available.");
         setPhase("lobby");
       });
     });
     peer.on("error", () => {
+      window.clearTimeout(connectTimerRef.current);
       setStatus("That room is no longer available.");
       setPhase("lobby");
     });
@@ -180,6 +222,7 @@ export default function Game() {
     const joinTimer = room ? window.setTimeout(() => joinRoom(room), 0) : undefined;
     return () => {
       if (joinTimer) window.clearTimeout(joinTimer);
+      window.clearTimeout(connectTimerRef.current);
       cancelAnimationFrame(rafRef.current);
       connRef.current?.close();
       peerRef.current?.destroy();
@@ -279,37 +322,65 @@ export default function Game() {
         }
       }
 
+      // ---- TRON backdrop ----
       const bg = ctx.createLinearGradient(0, 0, 0, h);
-      bg.addColorStop(0, "#0b1311"); bg.addColorStop(0.55, "#101c18"); bg.addColorStop(1, "#07100e");
+      bg.addColorStop(0, "#04101f"); bg.addColorStop(0.55, "#050b18"); bg.addColorStop(1, "#02040a");
       ctx.fillStyle = bg; ctx.fillRect(0, 0, w, h);
-      const glow = ctx.createRadialGradient(w / 2, h * 0.24, 10, w / 2, h * 0.24, w * 0.55);
-      glow.addColorStop(0, "rgba(186,255,87,.11)"); glow.addColorStop(1, "rgba(0,0,0,0)");
+      const glow = ctx.createRadialGradient(w / 2, h * 0.2, 10, w / 2, h * 0.2, w * 0.62);
+      glow.addColorStop(0, "rgba(25,231,255,.14)"); glow.addColorStop(1, "rgba(0,0,0,0)");
       ctx.fillStyle = glow; ctx.fillRect(0, 0, w, h);
 
       const flip = player === "guest";
       const a = project(-1, 0, w, h, flip), b = project(1, 0, w, h, flip), c = project(1, 1, w, h, flip), d = project(-1, 1, w, h, flip);
-      ctx.fillStyle = "rgba(0,0,0,.38)";
-      ctx.beginPath(); ctx.moveTo(a.x + 8, a.y + 24); ctx.lineTo(b.x + 8, b.y + 24); ctx.lineTo(c.x + 2, c.y + 16); ctx.lineTo(d.x + 2, d.y + 16); ctx.closePath(); ctx.fill();
+
+      // Dark table slab.
       const table = ctx.createLinearGradient(0, d.y, 0, a.y);
-      table.addColorStop(0, "#194b42"); table.addColorStop(1, "#0e6b5a"); ctx.fillStyle = table;
+      table.addColorStop(0, "rgba(8,27,42,.94)"); table.addColorStop(1, "rgba(5,15,26,.94)"); ctx.fillStyle = table;
       ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.lineTo(c.x, c.y); ctx.lineTo(d.x, d.y); ctx.closePath(); ctx.fill();
-      ctx.strokeStyle = "rgba(219,255,238,.82)"; ctx.lineWidth = 2; ctx.stroke();
+
+      // Neon perspective grid across the playfield.
+      ctx.save();
+      ctx.strokeStyle = "rgba(25,231,255,.26)"; ctx.lineWidth = 1; ctx.shadowColor = "rgba(25,231,255,.5)"; ctx.shadowBlur = 6;
+      for (let i = 1; i < 10; i++) {
+        const zz = i / 10, l = project(-1, zz, w, h, flip), r = project(1, zz, w, h, flip);
+        ctx.beginPath(); ctx.moveTo(l.x, l.y); ctx.lineTo(r.x, r.y); ctx.stroke();
+      }
+      for (let i = 1; i < 8; i++) {
+        const xx = -1 + (2 * i) / 8, t = project(xx, 0, w, h, flip), bt = project(xx, 1, w, h, flip);
+        ctx.beginPath(); ctx.moveTo(t.x, t.y); ctx.lineTo(bt.x, bt.y); ctx.stroke();
+      }
+      ctx.restore();
+
+      // Glowing table border.
+      ctx.save(); ctx.shadowColor = "rgba(25,231,255,.85)"; ctx.shadowBlur = 16;
+      ctx.strokeStyle = "rgba(130,246,255,.95)"; ctx.lineWidth = 2.4;
+      ctx.beginPath(); ctx.moveTo(a.x, a.y); ctx.lineTo(b.x, b.y); ctx.lineTo(c.x, c.y); ctx.lineTo(d.x, d.y); ctx.closePath(); ctx.stroke();
+      ctx.restore();
+
+      // Center line.
       const center1 = project(0, 0, w, h, flip), center2 = project(0, 1, w, h, flip);
-      ctx.beginPath(); ctx.moveTo(center1.x, center1.y); ctx.lineTo(center2.x, center2.y); ctx.strokeStyle = "rgba(225,255,241,.38)"; ctx.lineWidth = 1; ctx.stroke();
+      ctx.save(); ctx.shadowColor = "rgba(25,231,255,.7)"; ctx.shadowBlur = 8;
+      ctx.beginPath(); ctx.moveTo(center1.x, center1.y); ctx.lineTo(center2.x, center2.y); ctx.strokeStyle = "rgba(25,231,255,.5)"; ctx.lineWidth = 1.2; ctx.stroke(); ctx.restore();
+
+      // Net.
       const nl = project(-1.05, 0.5, w, h, flip), nr = project(1.05, 0.5, w, h, flip);
       ctx.beginPath(); ctx.moveTo(nl.x, nl.y - 16); ctx.lineTo(nr.x, nr.y - 16); ctx.lineTo(nr.x, nr.y + 2); ctx.lineTo(nl.x, nl.y + 2); ctx.closePath();
-      ctx.fillStyle = "rgba(6,12,10,.88)"; ctx.fill(); ctx.strokeStyle = "rgba(231,255,240,.65)"; ctx.lineWidth = 1; ctx.stroke();
+      ctx.fillStyle = "rgba(4,13,23,.72)"; ctx.fill();
+      ctx.save(); ctx.shadowColor = "rgba(25,231,255,.7)"; ctx.shadowBlur = 12;
+      ctx.strokeStyle = "rgba(130,246,255,.9)"; ctx.lineWidth = 1.4; ctx.stroke(); ctx.restore();
 
       const drawPaddle = (x: number, z: number, mine: boolean) => {
         const p = project(x, z, w, h, flip); const pw = 74 * p.scale; const ph = 12 * p.scale;
-        ctx.save(); ctx.translate(p.x, p.y - ph * 1.35); ctx.shadowColor = mine ? "rgba(194,255,81,.5)" : "rgba(255,104,68,.45)"; ctx.shadowBlur = 18;
-        ctx.fillStyle = mine ? "#c7ff55" : "#ff6844"; ctx.beginPath(); ctx.roundRect(-pw / 2, -ph / 2, pw, ph, ph / 2); ctx.fill(); ctx.restore();
+        ctx.save(); ctx.translate(p.x, p.y - ph * 1.35); ctx.shadowColor = mine ? "rgba(25,231,255,.8)" : "rgba(255,138,30,.75)"; ctx.shadowBlur = 22;
+        ctx.fillStyle = mine ? "#19e7ff" : "#ff8a1e"; ctx.beginPath(); ctx.roundRect(-pw / 2, -ph / 2, pw, ph, ph / 2); ctx.fill();
+        ctx.shadowBlur = 0; ctx.fillStyle = "rgba(255,255,255,.85)"; ctx.beginPath(); ctx.roundRect(-pw / 2 + 3, -ph / 2 + 2, pw - 6, ph * 0.32, ph * 0.16); ctx.fill();
+        ctx.restore();
       };
       drawPaddle(s.paddles.host, 0.035, player === "host"); drawPaddle(s.paddles.guest, 0.965, player === "guest");
       const ball = project(s.ball.x, s.ball.z, w, h, flip);
       const lift = Math.sin(clamp(s.ball.z, 0, 1) * Math.PI) * h * 0.09 + 20 * ball.scale;
-      ctx.fillStyle = "rgba(0,0,0,.28)"; ctx.beginPath(); ctx.ellipse(ball.x, ball.y, 13 * ball.scale, 5 * ball.scale, 0, 0, Math.PI * 2); ctx.fill();
-      ctx.save(); ctx.shadowColor = "rgba(255,255,255,.7)"; ctx.shadowBlur = 20; ctx.fillStyle = "#f7f6e8";
+      ctx.fillStyle = "rgba(0,0,0,.32)"; ctx.beginPath(); ctx.ellipse(ball.x, ball.y, 13 * ball.scale, 5 * ball.scale, 0, 0, Math.PI * 2); ctx.fill();
+      ctx.save(); ctx.shadowColor = "rgba(25,231,255,.95)"; ctx.shadowBlur = 24; ctx.fillStyle = "#eaffff";
       ctx.beginPath(); ctx.arc(ball.x, ball.y - lift, 7 * ball.scale, 0, Math.PI * 2); ctx.fill(); ctx.restore();
       rafRef.current = requestAnimationFrame(draw);
     };
@@ -329,6 +400,7 @@ export default function Game() {
     else send({ type: "restart" });
   };
   const leave = () => {
+    window.clearTimeout(connectTimerRef.current);
     connRef.current?.close(); peerRef.current?.destroy(); connRef.current = null; peerRef.current = null; stateRef.current = initialState();
     window.history.replaceState({}, "", window.location.pathname); setRoomUrl(""); setScore({ host: 0, guest: 0 });
     setWinner(undefined); setStatus("Choose how you want to play"); setPhase("lobby");
@@ -353,7 +425,7 @@ export default function Game() {
         <p className="lede">First-person table tennis, played straight from the browser. Open a room and send one link.</p>
         {phase === "lobby" && <button className="primary" onClick={createRoom}>Create a private room <span>↗</span></button>}
         {phase === "connecting" && <div className="loading"><i /><span>{status}</span></div>}
-        {phase === "waiting" && <div className="invite-box"><span className="invite-label">INVITE LINK</span><div><span>{roomUrl.replace(/^https?:\/\//, "")}</span><button onClick={copyLink}>{copied ? "COPIED" : "COPY"}</button></div><p><i /> Waiting for player two…</p></div>}
+        {phase === "waiting" && <div className="invite-box"><span className="invite-label">INVITE LINK</span><div><span>{roomUrl.replace(/^https?:\/\//, "")}</span><button onClick={copyLink}>{copied ? "COPIED" : "COPY"}</button></div><div className="invite-foot"><p><i /> Waiting for player two…</p><button className="cancel-room" onClick={leave}>Cancel</button></div></div>}
         <div className="how"><span>MOVE</span><kbd>A</kbd><kbd>D</kbd><span>OR DRAG / MOVE POINTER</span></div><small>{status}</small>
       </section>}
 
