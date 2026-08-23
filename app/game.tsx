@@ -89,6 +89,11 @@ const GUEST_PLANE = 0.94;  // guest paddle contact plane (z)
 // Fixed player identity: host is blue, guest is red — the same on both screens.
 const TEAM_COLOR: Record<Player, string> = { host: "#3aa0ff", guest: "#ff3b52" };
 const TEAM_GLOW: Record<Player, string> = { host: "rgba(58,160,255,.85)", guest: "rgba(255,59,82,.85)" };
+const hexToRgb = (hex: string) => {
+  const n = parseInt(hex.slice(1), 16);
+  return [(n >> 16) & 255, (n >> 8) & 255, n & 255] as const;
+};
+const rgba = (hex: string, a: number) => { const [r, g, b] = hexToRgb(hex); return `rgba(${r},${g},${b},${a})`; };
 
 // A serve: from the server's end, moderate speed toward the opponent, slight angle.
 const serveBall = (server: Player): GameState["ball"] => {
@@ -434,11 +439,29 @@ export default function Game() {
       ctx.save(); ctx.shadowColor = "rgba(25,231,255,.7)"; ctx.shadowBlur = 12;
       ctx.strokeStyle = "rgba(130,246,255,.9)"; ctx.lineWidth = 1.4; ctx.stroke(); ctx.restore();
 
+      // TRON identity disc: a glowing neon ring with a lit interior and hub.
       const drawPaddle = (x: number, z: number, team: Player) => {
-        const p = project(x, z, w, h, flip); const pw = 74 * p.scale; const ph = 12 * p.scale;
-        ctx.save(); ctx.translate(p.x, p.y - ph * 1.35); ctx.shadowColor = TEAM_GLOW[team]; ctx.shadowBlur = 22;
-        ctx.fillStyle = TEAM_COLOR[team]; ctx.beginPath(); ctx.roundRect(-pw / 2, -ph / 2, pw, ph, ph / 2); ctx.fill();
-        ctx.shadowBlur = 0; ctx.fillStyle = "rgba(255,255,255,.85)"; ctx.beginPath(); ctx.roundRect(-pw / 2 + 3, -ph / 2 + 2, pw - 6, ph * 0.32, ph * 0.16); ctx.fill();
+        const p = project(x, z, w, h, flip);
+        const col = TEAM_COLOR[team];
+        const rx = 42 * p.scale;      // disc radius (perspective-squashed to an ellipse)
+        const ry = 26 * p.scale;
+        const cx = p.x, cy = p.y - ry * 0.92;
+        ctx.save();
+        // Lit glass interior.
+        const fill = ctx.createRadialGradient(cx, cy, 1, cx, cy, rx);
+        fill.addColorStop(0, rgba(col, 0.32)); fill.addColorStop(0.68, rgba(col, 0.1)); fill.addColorStop(1, "rgba(0,0,0,0)");
+        ctx.fillStyle = fill;
+        ctx.beginPath(); ctx.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2); ctx.fill();
+        // Outer neon ring.
+        ctx.shadowColor = TEAM_GLOW[team]; ctx.shadowBlur = 24 * p.scale;
+        ctx.lineWidth = Math.max(2, 4.5 * p.scale); ctx.strokeStyle = col;
+        ctx.beginPath(); ctx.ellipse(cx, cy, rx, ry, 0, 0, Math.PI * 2); ctx.stroke();
+        // Bright inner rim.
+        ctx.shadowBlur = 0; ctx.lineWidth = Math.max(1, 1.6 * p.scale); ctx.strokeStyle = "rgba(255,255,255,.85)";
+        ctx.beginPath(); ctx.ellipse(cx, cy, rx * 0.68, ry * 0.68, 0, 0, Math.PI * 2); ctx.stroke();
+        // Hub.
+        ctx.fillStyle = "rgba(255,255,255,.9)";
+        ctx.beginPath(); ctx.ellipse(cx, cy, 3.2 * p.scale, 2.4 * p.scale, 0, 0, Math.PI * 2); ctx.fill();
         ctx.restore();
       };
       drawPaddle(s.paddles.host, 0.035, "host"); drawPaddle(s.paddles.guest, 0.965, "guest");
