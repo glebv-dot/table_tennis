@@ -71,14 +71,43 @@ type GameState = {
   winner?: Player;
 };
 
+const clamp = (n: number, min: number, max: number) => Math.max(min, Math.min(max, n));
+
+// --- Ball physics, tuned after classic Pong/Breakout best practices ---
+// The contact point on the paddle sets the return ANGLE (not just a velocity
+// nudge), speed climbs a little each rally and is conserved on bounces, and
+// collisions are swept across the paddle plane so a fast ball can't tunnel.
+const BASE_SPEED = 0.68;   // serve speed
+const MAX_SPEED = 1.16;    // rally cap
+const SPEEDUP = 1.045;     // speed multiplier per paddle hit
+const MAX_ANGLE = 1.02;    // rad (~58°): widest return angle off the paddle edge
+const PADDLE_REACH = 0.3;  // half-width the paddle can still return
+const SIDE = 0.95;         // side-wall x
+const HOST_PLANE = 0.06;   // host paddle contact plane (z)
+const GUEST_PLANE = 0.94;  // guest paddle contact plane (z)
+
+// Fixed player identity: host is blue, guest is red — the same on both screens.
+const TEAM_COLOR: Record<Player, string> = { host: "#3aa0ff", guest: "#ff3b52" };
+const TEAM_GLOW: Record<Player, string> = { host: "rgba(58,160,255,.85)", guest: "rgba(255,59,82,.85)" };
+
+// A serve: from the server's end, moderate speed toward the opponent, slight angle.
+const serveBall = (server: Player): GameState["ball"] => {
+  const dir = server === "host" ? 1 : -1; // host aims toward z=1, guest toward z=0
+  const angle = (Math.random() * 2 - 1) * 0.3;
+  return {
+    x: 0,
+    z: server === "host" ? 0.14 : 0.86,
+    vx: BASE_SPEED * Math.sin(angle),
+    vz: dir * BASE_SPEED * Math.cos(angle),
+  };
+};
+
 const initialState = (): GameState => ({
-  ball: { x: 0, z: 0.18, vx: 0.24, vz: 0.56 },
+  ball: serveBall("host"),
   paddles: { host: 0, guest: 0 },
   score: { host: 0, guest: 0 },
   serving: "host",
 });
-
-const clamp = (n: number, min: number, max: number) => Math.max(min, Math.min(max, n));
 
 export default function Game() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
@@ -90,6 +119,8 @@ export default function Game() {
   const rafRef = useRef(0);
   const connectTimerRef = useRef<number | undefined>(undefined);
   const keysRef = useRef(new Set<string>());
+  const trailRef = useRef<{ x: number; z: number }[]>([]);
+  const paddlePrevRef = useRef({ host: 0, guest: 0 });
   const [phase, setPhaseState] = useState<Phase>("lobby");
   const [role, setRole] = useState<Player>("host");
   const [roomUrl, setRoomUrl] = useState("");
@@ -111,12 +142,8 @@ export default function Game() {
   const resetRound = useCallback((server: Player) => {
     const s = stateRef.current;
     s.serving = server;
-    s.ball = {
-      x: 0,
-      z: server === "host" ? 0.18 : 0.82,
-      vx: (Math.random() * 0.38 - 0.19) || 0.12,
-      vz: server === "host" ? 0.58 : -0.58,
-    };
+    s.ball = serveBall(server);
+    trailRef.current = [];
   }, []);
 
   const finishConnection = useCallback((conn: DataConnection, playerRole: Player) => {
@@ -127,6 +154,7 @@ export default function Game() {
     setStatus("Connected · first to 7 wins");
     setPhase("playing");
     stateRef.current = initialState();
+    trailRef.current = [];
     setScore({ host: 0, guest: 0 });
     setWinner(undefined);
 
@@ -145,6 +173,7 @@ export default function Game() {
       }
       if (msg.type === "restart" && playerRole === "host") {
         stateRef.current = initialState();
+        trailRef.current = [];
         setScore({ host: 0, guest: 0 });
         setWinner(undefined);
         setPhase("playing");
@@ -288,25 +317,48 @@ export default function Game() {
         if (left || right) movePaddle(s.paddles[player] + (right ? 1 : -1) * dt * 1.55);
 
         if (player === "host") {
-          const ballState = s.ball;
-          ballState.x += ballState.vx * dt;
-          ballState.z += ballState.vz * dt;
-          if (Math.abs(ballState.x) > 0.94) {
-            ballState.x = Math.sign(ballState.x) * 0.94;
-            ballState.vx *= -1;
-          }
-          const hitHost = ballState.vz < 0 && ballState.z < 0.075 && ballState.z > -0.02 && Math.abs(ballState.x - s.paddles.host) < 0.29;
-          const hitGuest = ballState.vz > 0 && ballState.z > 0.925 && ballState.z < 1.02 && Math.abs(ballState.x - s.paddles.guest) < 0.29;
-          if (hitHost || hitGuest) {
-            const paddle = hitHost ? s.paddles.host : s.paddles.guest;
-            ballState.z = hitHost ? 0.078 : 0.922;
-            ballState.vz = (hitHost ? 1 : -1) * Math.min(Math.abs(ballState.vz) * 1.045, 0.92);
-            ballState.vx = clamp(ballState.vx + (ballState.x - paddle) * 0.72, -0.7, 0.7);
-          }
-          if (ballState.z < -0.08 || ballState.z > 1.08) {
-            const point: Player = ballState.z < 0 ? "guest" : "host";
+          const b = s.ball;
+          const prevZ = b.z;
+          // Paddle speeds this frame — a bit of the paddle's motion steers the ball.
+          const hostVel = (s.paddles.host - paddlePrevRef.current.host) / dt;
+          const guestVel = (s.paddles.guest - paddlePrevRef.current.guest) / dt;
+
+          b.x += b.vx * dt;
+          b.z += b.vz * dt;
+
+          // Side walls: reflect, conserve speed.
+          if (b.x > SIDE) { b.x = SIDE; b.vx = -Math.abs(b.vx); }
+          else if (b.x < -SIDE) { b.x = -SIDE; b.vx = Math.abs(b.vx); }
+
+          // Paddle return — swept across the contact plane so fast balls can't tunnel.
+          // The contact offset sets the outgoing angle; speed is conserved + nudged up.
+          const tryReturn = (plane: number, paddle: number, dir: 1 | -1, pv: number) => {
+            const toward = dir === 1 ? b.vz < 0 : b.vz > 0;
+            const crossed = (prevZ - plane) * (b.z - plane) <= 0;
+            if (!toward || !crossed) return false;
+            const span = b.z - prevZ;
+            const f = Math.abs(span) < 1e-6 ? 0 : (plane - prevZ) / span;
+            const xAt = (b.x - b.vx * dt) + b.vx * dt * f;
+            const offset = (xAt - paddle) / PADDLE_REACH;
+            if (Math.abs(offset) > 1.05) return false; // edge of the paddle → miss
+            const speed = Math.min(Math.hypot(b.vx, b.vz) * SPEEDUP, MAX_SPEED);
+            const aim = clamp(clamp(offset, -1, 1) + pv * 0.11, -1, 1);
+            const angle = aim * MAX_ANGLE;
+            b.x = xAt;
+            b.z = plane + dir * 0.002;
+            b.vz = dir * speed * Math.cos(angle);
+            b.vx = speed * Math.sin(angle);
+            return true;
+          };
+          tryReturn(HOST_PLANE, s.paddles.host, 1, hostVel) ||
+            tryReturn(GUEST_PLANE, s.paddles.guest, -1, guestVel);
+
+          // Point when the ball passes an end line.
+          if (b.z < -0.06 || b.z > 1.06) {
+            const point: Player = b.z < 0 ? "guest" : "host";
             s.score[point] += 1;
             setScore({ ...s.score });
+            trailRef.current = [];
             if (s.score[point] >= 7) {
               s.winner = point;
               setWinner(point);
@@ -314,11 +366,22 @@ export default function Game() {
               setPhase("ended");
             } else resetRound(point === "host" ? "guest" : "host");
           }
+
+          paddlePrevRef.current.host = s.paddles.host;
+          paddlePrevRef.current.guest = s.paddles.guest;
           networkTick += dt;
           if (networkTick > 1 / 30) {
             send({ type: "state", state: s });
             networkTick = 0;
           }
+        }
+
+        // Ball light-trail (both sides render it from the ball position they see).
+        const tr = trailRef.current;
+        const lastP = tr[tr.length - 1];
+        if (!lastP || Math.hypot(lastP.x - s.ball.x, lastP.z - s.ball.z) > 0.004) {
+          tr.push({ x: s.ball.x, z: s.ball.z });
+          if (tr.length > 16) tr.shift();
         }
       }
 
@@ -330,7 +393,9 @@ export default function Game() {
       glow.addColorStop(0, "rgba(25,231,255,.14)"); glow.addColorStop(1, "rgba(0,0,0,0)");
       ctx.fillStyle = glow; ctx.fillRect(0, 0, w, h);
 
-      const flip = player === "guest";
+      // First-person POV: your own end is always the near (bottom) edge.
+      // host plays end z≈0, guest plays end z≈1 — flip so "mine" sits in front.
+      const flip = player === "host";
       const a = project(-1, 0, w, h, flip), b = project(1, 0, w, h, flip), c = project(1, 1, w, h, flip), d = project(-1, 1, w, h, flip);
 
       // Dark table slab.
@@ -369,18 +434,34 @@ export default function Game() {
       ctx.save(); ctx.shadowColor = "rgba(25,231,255,.7)"; ctx.shadowBlur = 12;
       ctx.strokeStyle = "rgba(130,246,255,.9)"; ctx.lineWidth = 1.4; ctx.stroke(); ctx.restore();
 
-      const drawPaddle = (x: number, z: number, mine: boolean) => {
+      const drawPaddle = (x: number, z: number, team: Player) => {
         const p = project(x, z, w, h, flip); const pw = 74 * p.scale; const ph = 12 * p.scale;
-        ctx.save(); ctx.translate(p.x, p.y - ph * 1.35); ctx.shadowColor = mine ? "rgba(25,231,255,.8)" : "rgba(255,138,30,.75)"; ctx.shadowBlur = 22;
-        ctx.fillStyle = mine ? "#19e7ff" : "#ff8a1e"; ctx.beginPath(); ctx.roundRect(-pw / 2, -ph / 2, pw, ph, ph / 2); ctx.fill();
+        ctx.save(); ctx.translate(p.x, p.y - ph * 1.35); ctx.shadowColor = TEAM_GLOW[team]; ctx.shadowBlur = 22;
+        ctx.fillStyle = TEAM_COLOR[team]; ctx.beginPath(); ctx.roundRect(-pw / 2, -ph / 2, pw, ph, ph / 2); ctx.fill();
         ctx.shadowBlur = 0; ctx.fillStyle = "rgba(255,255,255,.85)"; ctx.beginPath(); ctx.roundRect(-pw / 2 + 3, -ph / 2 + 2, pw - 6, ph * 0.32, ph * 0.16); ctx.fill();
         ctx.restore();
       };
-      drawPaddle(s.paddles.host, 0.035, player === "host"); drawPaddle(s.paddles.guest, 0.965, player === "guest");
+      drawPaddle(s.paddles.host, 0.035, "host"); drawPaddle(s.paddles.guest, 0.965, "guest");
+
+      // Ball light-trail across the grid.
+      const trail = trailRef.current;
+      if (trail.length > 1) {
+        ctx.save(); ctx.lineCap = "round"; ctx.shadowColor = "rgba(150,240,255,.8)"; ctx.shadowBlur = 12;
+        for (let i = 1; i < trail.length; i++) {
+          const p0 = project(trail[i - 1].x, trail[i - 1].z, w, h, flip);
+          const p1 = project(trail[i].x, trail[i].z, w, h, flip);
+          const t = i / trail.length;
+          ctx.strokeStyle = `rgba(180,245,255,${(t * 0.5).toFixed(3)})`;
+          ctx.lineWidth = Math.max(0.5, t * 5 * p1.scale);
+          ctx.beginPath(); ctx.moveTo(p0.x, p0.y); ctx.lineTo(p1.x, p1.y); ctx.stroke();
+        }
+        ctx.restore();
+      }
+
       const ball = project(s.ball.x, s.ball.z, w, h, flip);
       const lift = Math.sin(clamp(s.ball.z, 0, 1) * Math.PI) * h * 0.09 + 20 * ball.scale;
       ctx.fillStyle = "rgba(0,0,0,.32)"; ctx.beginPath(); ctx.ellipse(ball.x, ball.y, 13 * ball.scale, 5 * ball.scale, 0, 0, Math.PI * 2); ctx.fill();
-      ctx.save(); ctx.shadowColor = "rgba(25,231,255,.95)"; ctx.shadowBlur = 24; ctx.fillStyle = "#eaffff";
+      ctx.save(); ctx.shadowColor = "rgba(200,248,255,.95)"; ctx.shadowBlur = 24; ctx.fillStyle = "#f2ffff";
       ctx.beginPath(); ctx.arc(ball.x, ball.y - lift, 7 * ball.scale, 0, Math.PI * 2); ctx.fill(); ctx.restore();
       rafRef.current = requestAnimationFrame(draw);
     };
@@ -396,12 +477,12 @@ export default function Game() {
     await navigator.clipboard.writeText(roomUrl); setCopied(true); window.setTimeout(() => setCopied(false), 1800);
   };
   const restart = () => {
-    if (role === "host") { stateRef.current = initialState(); setScore({ host: 0, guest: 0 }); setWinner(undefined); setPhase("playing"); }
+    if (role === "host") { stateRef.current = initialState(); trailRef.current = []; setScore({ host: 0, guest: 0 }); setWinner(undefined); setPhase("playing"); }
     else send({ type: "restart" });
   };
   const leave = () => {
     window.clearTimeout(connectTimerRef.current);
-    connRef.current?.close(); peerRef.current?.destroy(); connRef.current = null; peerRef.current = null; stateRef.current = initialState();
+    connRef.current?.close(); peerRef.current?.destroy(); connRef.current = null; peerRef.current = null; stateRef.current = initialState(); trailRef.current = [];
     window.history.replaceState({}, "", window.location.pathname); setRoomUrl(""); setScore({ host: 0, guest: 0 });
     setWinner(undefined); setStatus("Choose how you want to play"); setPhase("lobby");
   };
@@ -409,13 +490,16 @@ export default function Game() {
   const yourScore = role === "host" ? score.host : score.guest;
   const theirScore = role === "host" ? score.guest : score.host;
   const won = winner === role;
+  const myColor = TEAM_COLOR[role];
+  const oppColor = TEAM_COLOR[role === "host" ? "guest" : "host"];
+  const myTeam = role === "host" ? "BLUE" : "RED";
 
   return (
     <main className="game-shell">
       <canvas ref={canvasRef} className="game-canvas" onPointerMove={(e) => phase === "playing" && pointFromPointer(e.clientX)} onPointerDown={(e) => { e.currentTarget.setPointerCapture(e.pointerId); pointFromPointer(e.clientX); }} aria-label="First-person table tennis game" />
       <header className="topbar">
         <button className="brand" onClick={leave}><i /> RALLY<span>ROOM</span></button>
-        {phase === "playing" || phase === "ended" ? <div className="scoreboard"><span>YOU <b>{yourScore}</b></span><em>FIRST TO 7</em><span><b>{theirScore}</b> RIVAL</span></div> : <div className="online"><i /> PEER-TO-PEER</div>}
+        {phase === "playing" || phase === "ended" ? <div className="scoreboard"><span>YOU <b style={{ color: myColor, textShadow: `0 0 14px ${myColor}` }}>{yourScore}</b></span><em>FIRST TO 7</em><span><b style={{ color: oppColor, textShadow: `0 0 14px ${oppColor}` }}>{theirScore}</b> RIVAL</span></div> : <div className="online"><i /> PEER-TO-PEER</div>}
         {phase !== "lobby" && <button className="leave" onClick={leave}>Leave table</button>}
       </header>
 
@@ -429,8 +513,8 @@ export default function Game() {
         <div className="how"><span>MOVE</span><kbd>A</kbd><kbd>D</kbd><span>OR DRAG / MOVE POINTER</span></div><small>{status}</small>
       </section>}
 
-      {phase === "playing" && <div className="play-hud"><div className="role-tag"><span /> {role === "host" ? "NEAR SIDE" : "FAR SIDE"}</div><div className="hint">MOVE YOUR PADDLE <b>←</b><b>→</b></div></div>}
-      {phase === "ended" && <section className="result-card"><p>{won ? "MATCH POINT" : "FINAL SCORE"}</p><h2>{won ? "You own the table." : "Good rally."}</h2><div className="final-score"><b>{yourScore}</b><span>—</span><b>{theirScore}</b></div><button className="primary" onClick={restart}>Play again <span>↻</span></button><button className="text-button" onClick={leave}>Leave the room</button></section>}
+      {phase === "playing" && <div className="play-hud"><div className="role-tag" style={{ color: myColor }}><span style={{ background: myColor, boxShadow: `0 0 12px ${myColor}` }} /> {myTeam} · YOUR SIDE</div><div className="hint">MOVE YOUR PADDLE <b>←</b><b>→</b></div></div>}
+      {phase === "ended" && <section className="result-card"><p>{won ? "MATCH POINT" : "FINAL SCORE"}</p><h2>{won ? "You own the table." : "Good rally."}</h2><div className="final-score"><b style={{ color: myColor, textShadow: `0 0 22px ${myColor}` }}>{yourScore}</b><span>—</span><b style={{ color: oppColor, textShadow: `0 0 22px ${oppColor}` }}>{theirScore}</b></div><button className="primary" onClick={restart}>Play again <span>↻</span></button><button className="text-button" onClick={leave}>Leave the room</button></section>}
       <footer><span>NO SIGN-UP · NO DOWNLOAD</span><span>RALLYROOM / 2026</span></footer>
     </main>
   );
