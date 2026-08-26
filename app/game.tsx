@@ -1,65 +1,25 @@
 "use client";
 
 import { useCallback, useEffect, useRef, useState } from "react";
+import { createClient, type RealtimeChannel } from "@supabase/supabase-js";
 
-type DataConnection = {
-  open: boolean;
-  send: (payload: unknown) => void;
-  close: () => void;
-  on: {
-    (event: "open" | "close" | "error", callback: () => void): void;
-    (event: "data", callback: (data: unknown) => void): void;
-  };
-};
-type Peer = {
-  connect: (id: string, options?: Record<string, unknown>) => DataConnection;
-  destroy: () => void;
-  on: {
-    (event: "open", callback: (id: string) => void): void;
-    (event: "connection", callback: (connection: DataConnection) => void): void;
-    (event: "error", callback: () => void): void;
-  };
-};
-type IceServer = { urls: string | string[]; username?: string; credential?: string };
-type PeerOptions = { config?: { iceServers: IceServer[] } };
-type PeerConstructor = new (id?: string, options?: PeerOptions) => Peer;
+// Realtime relay via Supabase. Both players connect OUTBOUND to a shared
+// channel keyed by the room id, so play works through any NAT/firewall
+// (mobile data, corporate Wi-Fi) — no WebRTC, STUN, or TURN required.
+// The publishable key is public by design; it is safe to ship in the client.
+const SUPABASE_URL = "https://vgurpottnlcixzjmatlz.supabase.co";
+const SUPABASE_KEY = "sb_publishable_Z_bn03NXzq2KCxQxsCAB5Q_jzMHRUd5";
+let supabaseClient: ReturnType<typeof createClient> | null = null;
+const getSupabase = () =>
+  (supabaseClient ??= createClient(SUPABASE_URL, SUPABASE_KEY, {
+    auth: { persistSession: false, autoRefreshToken: false },
+    realtime: { params: { eventsPerSecond: 40 } },
+  }));
 
-declare global { interface Window { Peer?: PeerConstructor } }
+// How long a joiner waits for the host before giving up.
+const JOIN_TIMEOUT_MS = 20000;
 
-// STUN handles simple NATs; the TURN relay is what makes cross-network play
-// actually work (mobile data, corporate/symmetric NAT). Without it, peers on
-// different networks never open a data channel and the lobby hangs forever.
-// These are free public servers — swap in your own TURN creds for production.
-const ICE_SERVERS: IceServer[] = [
-  { urls: "stun:stun.l.google.com:19302" },
-  { urls: "stun:stun1.l.google.com:19302" },
-  {
-    urls: [
-      "turn:openrelay.metered.ca:80",
-      "turn:openrelay.metered.ca:443",
-      "turn:openrelay.metered.ca:443?transport=tcp",
-    ],
-    username: "openrelayproject",
-    credential: "openrelayproject",
-  },
-];
-
-// How long to wait for a peer connection before telling the user it failed,
-// instead of leaving them staring at a frozen lobby.
-const CONNECT_TIMEOUT_MS = 25000;
-
-let peerLoader: Promise<PeerConstructor> | null = null;
-const loadPeer = () => {
-  if (window.Peer) return Promise.resolve(window.Peer);
-  if (!peerLoader) peerLoader = new Promise((resolve, reject) => {
-    const script = document.createElement("script");
-    script.src = "https://unpkg.com/peerjs@1.5.5/dist/peerjs.min.js";
-    script.onload = () => window.Peer ? resolve(window.Peer) : reject(new Error("PeerJS unavailable"));
-    script.onerror = () => reject(new Error("PeerJS failed to load"));
-    document.head.appendChild(script);
-  });
-  return peerLoader;
-};
+type Msg = { type?: string; x?: number; state?: GameState };
 
 type Phase = "lobby" | "connecting" | "waiting" | "playing" | "ended";
 type Player = "host" | "guest";
@@ -116,8 +76,7 @@ const initialState = (): GameState => ({
 
 export default function Game() {
   const canvasRef = useRef<HTMLCanvasElement>(null);
-  const peerRef = useRef<Peer | null>(null);
-  const connRef = useRef<DataConnection | null>(null);
+  const channelRef = useRef<RealtimeChannel | null>(null);
   const stateRef = useRef<GameState>(initialState());
   const roleRef = useRef<Player>("host");
   const phaseRef = useRef<Phase>("lobby");
@@ -140,8 +99,7 @@ export default function Game() {
   }, []);
 
   const send = useCallback((payload: unknown) => {
-    const conn = connRef.current;
-    if (conn?.open) conn.send(payload);
+    channelRef.current?.send({ type: "broadcast", event: "msg", payload });
   }, []);
 
   const resetRound = useCallback((server: Player) => {
@@ -151,124 +109,113 @@ export default function Game() {
     trailRef.current = [];
   }, []);
 
-  const finishConnection = useCallback((conn: DataConnection, playerRole: Player) => {
+  // Incoming relayed messages (same protocol as before, now over the channel).
+  const handleData = useCallback((msg: Msg) => {
+    const playerRole = roleRef.current;
+    if (msg.type === "paddle" && playerRole === "host" && typeof msg.x === "number") {
+      stateRef.current.paddles.guest = clamp(msg.x, -0.82, 0.82);
+    } else if (msg.type === "state" && playerRole === "guest" && msg.state) {
+      const myPaddle = stateRef.current.paddles.guest; // keep own paddle responsive
+      stateRef.current = msg.state;
+      stateRef.current.paddles.guest = myPaddle;
+      setScore(msg.state.score);
+      if (msg.state.winner) { setWinner(msg.state.winner); setPhase("ended"); }
+    } else if (msg.type === "restart" && playerRole === "host") {
+      stateRef.current = initialState();
+      trailRef.current = [];
+      setScore({ host: 0, guest: 0 });
+      setWinner(undefined);
+      setPhase("playing");
+    }
+  }, [setPhase]);
+
+  const startMatch = useCallback(() => {
     window.clearTimeout(connectTimerRef.current);
-    connRef.current = conn;
-    roleRef.current = playerRole;
-    setRole(playerRole);
     setStatus("Connected · first to 7 wins");
-    setPhase("playing");
     stateRef.current = initialState();
     trailRef.current = [];
     setScore({ host: 0, guest: 0 });
     setWinner(undefined);
-
-    conn.on("data", (raw) => {
-      const msg = raw as { type?: string; x?: number; state?: GameState };
-      if (msg.type === "paddle" && playerRole === "host" && typeof msg.x === "number") {
-        stateRef.current.paddles.guest = clamp(msg.x, -0.82, 0.82);
-      }
-      if (msg.type === "state" && playerRole === "guest" && msg.state) {
-        stateRef.current = msg.state;
-        setScore(msg.state.score);
-        if (msg.state.winner) {
-          setWinner(msg.state.winner);
-          setPhase("ended");
-        }
-      }
-      if (msg.type === "restart" && playerRole === "host") {
-        stateRef.current = initialState();
-        trailRef.current = [];
-        setScore({ host: 0, guest: 0 });
-        setWinner(undefined);
-        setPhase("playing");
-      }
-    });
-    conn.on("close", () => {
-      setStatus("Your opponent left the table");
-      setPhase("waiting");
-    });
-    conn.on("error", () => {
-      setStatus("Connection lost. Try a fresh room.");
-      setPhase("waiting");
-    });
+    setPhase("playing");
   }, [setPhase]);
 
-  const createRoom = useCallback(async () => {
-    setPhase("connecting");
-    setStatus("Opening a table…");
-    const PeerClass = await loadPeer();
-    const peer = new PeerClass(undefined, { config: { iceServers: ICE_SERVERS } });
-    peerRef.current = peer;
-    peer.on("open", (id) => {
-      const url = new URL(window.location.href);
-      url.searchParams.set("room", id);
-      setRoomUrl(url.toString());
-      window.history.replaceState({}, "", url);
-      setStatus("Send the link to your opponent");
-      setPhase("waiting");
+  // Join a room's realtime channel. Presence tells us when both seats are
+  // filled (→ start) or when the opponent leaves.
+  const openChannel = useCallback((roomId: string, playerRole: Player) => {
+    const supa = getSupabase();
+    roleRef.current = playerRole;
+    setRole(playerRole);
+    const channel = supa.channel(`rally:${roomId}`, {
+      config: { broadcast: { self: false }, presence: { key: playerRole } },
     });
-    peer.on("connection", (conn) => {
-      // The incoming connection isn't usable until its channel opens; only then
-      // do we start the match, so a failed handshake doesn't strand the host.
-      if (conn.open) finishConnection(conn, "host");
-      else conn.on("open", () => finishConnection(conn, "host"));
-    });
-    peer.on("error", () => {
-      setStatus("Couldn’t open a room. Please try again.");
-      setPhase("lobby");
-    });
-  }, [finishConnection, setPhase]);
+    channelRef.current = channel;
 
-  const joinRoom = useCallback(async (roomId: string) => {
-    setPhase("connecting");
-    setStatus("Joining the table…");
-    const PeerClass = await loadPeer();
-    const peer = new PeerClass(undefined, { config: { iceServers: ICE_SERVERS } });
-    peerRef.current = peer;
-    // If the data channel never opens (unreachable host / blocked network),
-    // surface it instead of spinning on "Joining…" forever.
-    connectTimerRef.current = window.setTimeout(() => {
-      if (phaseRef.current === "playing") return;
-      peerRef.current?.destroy();
-      peerRef.current = null;
-      setStatus("Couldn’t reach the host. Check the link or try a different network.");
-      setPhase("lobby");
-    }, CONNECT_TIMEOUT_MS);
-    peer.on("open", () => {
-      const conn = peer.connect(roomId, { reliable: false, serialization: "json" });
-      conn.on("open", () => finishConnection(conn, "guest"));
-      conn.on("error", () => {
-        window.clearTimeout(connectTimerRef.current);
-        setStatus("That room is no longer available.");
-        setPhase("lobby");
+    const maybeStart = () => {
+      const present = channel.presenceState() as Record<string, unknown[]>;
+      if (present["host"]?.length && present["guest"]?.length &&
+          phaseRef.current !== "playing" && phaseRef.current !== "ended") {
+        startMatch();
+      }
+    };
+
+    channel
+      .on("broadcast", { event: "msg" }, ({ payload }) => handleData(payload as Msg))
+      .on("presence", { event: "sync" }, maybeStart)
+      .on("presence", { event: "join" }, maybeStart)
+      .on("presence", { event: "leave" }, ({ key }) => {
+        if (key !== playerRole && (phaseRef.current === "playing" || phaseRef.current === "ended")) {
+          setStatus("Your opponent left the table");
+          setPhase("waiting");
+        }
+      })
+      .subscribe((s: string) => {
+        if (s === "SUBSCRIBED") {
+          channel.track({ role: playerRole });
+          if (playerRole === "host") {
+            setStatus("Send the link to your opponent");
+            setPhase("waiting");
+          } else {
+            setStatus("Joining the table…");
+            setPhase("connecting");
+            connectTimerRef.current = window.setTimeout(() => {
+              if (phaseRef.current === "playing") return;
+              setStatus("Couldn’t reach the host — the room may be closed. Ask for a fresh link.");
+              setPhase("lobby");
+            }, JOIN_TIMEOUT_MS);
+          }
+        } else if (s === "CHANNEL_ERROR" || s === "TIMED_OUT") {
+          setStatus("Realtime connection failed. Please try again.");
+          setPhase("lobby");
+        }
       });
-    });
-    peer.on("error", () => {
-      window.clearTimeout(connectTimerRef.current);
-      setStatus("That room is no longer available.");
-      setPhase("lobby");
-    });
-  }, [finishConnection, setPhase]);
+  }, [handleData, startMatch, setPhase]);
+
+  const createRoom = useCallback(() => {
+    const roomId = crypto.randomUUID();
+    const url = new URL(window.location.href);
+    url.searchParams.set("room", roomId);
+    setRoomUrl(url.toString());
+    window.history.replaceState({}, "", url);
+    setStatus("Opening a table…");
+    setPhase("connecting");
+    openChannel(roomId, "host");
+  }, [openChannel, setPhase]);
 
   useEffect(() => {
     const room = new URLSearchParams(window.location.search).get("room");
-    const joinTimer = room ? window.setTimeout(() => joinRoom(room), 0) : undefined;
+    const joinTimer = room ? window.setTimeout(() => openChannel(room, "guest"), 0) : undefined;
     return () => {
       if (joinTimer) window.clearTimeout(joinTimer);
       window.clearTimeout(connectTimerRef.current);
       cancelAnimationFrame(rafRef.current);
-      connRef.current?.close();
-      peerRef.current?.destroy();
+      const ch = channelRef.current;
+      if (ch) { getSupabase().removeChannel(ch); channelRef.current = null; }
     };
-  }, [joinRoom]);
+  }, [openChannel]);
 
   const movePaddle = useCallback((x: number) => {
-    const s = stateRef.current;
-    const player = roleRef.current;
-    s.paddles[player] = clamp(x, -0.82, 0.82);
-    if (player === "guest") send({ type: "paddle", x: s.paddles.guest });
-  }, [send]);
+    stateRef.current.paddles[roleRef.current] = clamp(x, -0.82, 0.82);
+  }, []);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent) => {
@@ -291,6 +238,7 @@ export default function Game() {
     if (!ctx) return;
     let last = performance.now();
     let networkTick = 0;
+    let lastSentPaddle = NaN;
 
     const project = (x: number, z: number, w: number, h: number, flip: boolean) => {
       const depth = flip ? 1 - z : z;
@@ -377,6 +325,16 @@ export default function Game() {
           networkTick += dt;
           if (networkTick > 1 / 30) {
             send({ type: "state", state: s });
+            networkTick = 0;
+          }
+        } else {
+          // Guest streams its paddle to the host, throttled and only when moved.
+          networkTick += dt;
+          if (networkTick > 1 / 30) {
+            if (s.paddles.guest !== lastSentPaddle) {
+              send({ type: "paddle", x: s.paddles.guest });
+              lastSentPaddle = s.paddles.guest;
+            }
             networkTick = 0;
           }
         }
@@ -501,11 +459,13 @@ export default function Game() {
   };
   const restart = () => {
     if (role === "host") { stateRef.current = initialState(); trailRef.current = []; setScore({ host: 0, guest: 0 }); setWinner(undefined); setPhase("playing"); }
-    else send({ type: "restart" });
+    else { trailRef.current = []; setScore({ host: 0, guest: 0 }); setWinner(undefined); setPhase("playing"); send({ type: "restart" }); }
   };
   const leave = () => {
     window.clearTimeout(connectTimerRef.current);
-    connRef.current?.close(); peerRef.current?.destroy(); connRef.current = null; peerRef.current = null; stateRef.current = initialState(); trailRef.current = [];
+    const ch = channelRef.current;
+    if (ch) { getSupabase().removeChannel(ch); channelRef.current = null; }
+    stateRef.current = initialState(); trailRef.current = [];
     window.history.replaceState({}, "", window.location.pathname); setRoomUrl(""); setScore({ host: 0, guest: 0 });
     setWinner(undefined); setStatus("Choose how you want to play"); setPhase("lobby");
   };
@@ -522,7 +482,7 @@ export default function Game() {
       <canvas ref={canvasRef} className="game-canvas" onPointerMove={(e) => phase === "playing" && pointFromPointer(e.clientX)} onPointerDown={(e) => { e.currentTarget.setPointerCapture(e.pointerId); pointFromPointer(e.clientX); }} aria-label="First-person table tennis game" />
       <header className="topbar">
         <button className="brand" onClick={leave}><i /> RALLY<span>ROOM</span></button>
-        {phase === "playing" || phase === "ended" ? <div className="scoreboard"><span>YOU <b style={{ color: myColor, textShadow: `0 0 14px ${myColor}` }}>{yourScore}</b></span><em>FIRST TO 7</em><span><b style={{ color: oppColor, textShadow: `0 0 14px ${oppColor}` }}>{theirScore}</b> RIVAL</span></div> : <div className="online"><i /> PEER-TO-PEER</div>}
+        {phase === "playing" || phase === "ended" ? <div className="scoreboard"><span>YOU <b style={{ color: myColor, textShadow: `0 0 14px ${myColor}` }}>{yourScore}</b></span><em>FIRST TO 7</em><span><b style={{ color: oppColor, textShadow: `0 0 14px ${oppColor}` }}>{theirScore}</b> RIVAL</span></div> : <div className="online"><i /> REALTIME</div>}
         {phase !== "lobby" && <button className="leave" onClick={leave}>Leave table</button>}
       </header>
 
